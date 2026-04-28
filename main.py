@@ -150,8 +150,12 @@ def maker_loop():
                 if ids:
                     for label, tid in [("UP", ids["up"]), ("DOWN", ids["down"])]:
                         bid = get_best_bid(tid)
-                        if bid and validate_order(2.0):
-                            place_order(label, 2.0, bid * 0.95, "MakerRebate", tid)
+                        if bid:
+                            limit_price = bid * 0.95
+                            # Determine shares so that notional >= $1
+                            q = max(int(1.0 / limit_price) + 1, 1)
+                            if validate_order(q * limit_price):
+                                place_order(label, q, limit_price, "MakerRebate", tid)
         except Exception as e:
             logging.error(f"maker_loop: {e}")
         time.sleep(60)
@@ -165,18 +169,25 @@ def arb_loop():
                     up_ask = get_best_ask(ids["up"])
                     down_ask = get_best_ask(ids["down"])
                     if up_ask and down_ask and (up_ask + down_ask) < 1.0:
-                        if validate_order(up_ask) and validate_order(down_ask):
-                            place_order("UP", 1, up_ask, "NegSpreadArb", ids["up"])
-                            place_order("DOWN", 1, down_ask, "NegSpreadArb", ids["down"])
-                            profit = 1.0 - (up_ask + down_ask)
-                            add_trade("NegSpreadArb", "ARB", 1, up_ask + down_ask, profit)
-                            logging.info(f"🎯 ARB: cost ${up_ask+down_ask:.4f} | profit ${profit:.4f}")
+                        # Calculate shares needed to meet $1 notional for each leg
+                        q_up = max(int(1.0 / up_ask) + 1, 1)   # ceil(1/up_ask)
+                        q_down = max(int(1.0 / down_ask) + 1, 1)
+                        q = max(q_up, q_down)   # same quantity for both sides
+                        
+                        total_cost = q * (up_ask + down_ask)
+                        if total_cost > PAPER_BALANCE * 0.2:
+                            logging.warning(f"ARB cost ${total_cost:.2f} exceeds 20% risk cap, skipping")
+                            continue
+                        
+                        place_order("UP", q, up_ask, "NegSpreadArb", ids["up"])
+                        place_order("DOWN", q, down_ask, "NegSpreadArb", ids["down"])
+                        
+                        profit = q * (1.0 - (up_ask + down_ask))
+                        add_trade("NegSpreadArb", "ARB", q, up_ask + down_ask, profit)
+                        logging.info(f"🎯 ARB: qty {q} | cost ${total_cost:.2f} | profit ${profit:.4f}")
         except Exception as e:
             logging.error(f"arb_loop: {e}")
         time.sleep(5)
-
-p0 = None
-last_cycle = None
 
 def sniper_loop():
     global p0, last_cycle
