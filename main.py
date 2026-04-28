@@ -1,20 +1,24 @@
-import os, time, logging, threading, json, random
+import os, time, logging, threading, json, random, requests
 from datetime import datetime, timezone
 from collections import deque
-import requests
 from flask import Flask
 
-# ---------- Config ----------
+# ---------- Configuration ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 
-PAPER_TRADING = os.getenv("PAPER_TRADING", "True").lower() == "true"
 PORT = int(os.getenv("PORT", "80"))
-PAPER_BALANCE = float(os.getenv("INITIAL_CAPITAL", "5"))
+PAPER_TRADING = os.getenv("PAPER_TRADING", "True").lower() == "true"
+PAPER_BALANCE = float(os.getenv("INITIAL_CAPITAL", "10"))
+
+# Polymarket L2 credentials (for live trading)
+POLY_API_KEY = os.getenv("POLY_API_KEY", "")
+POLY_API_SECRET = os.getenv("POLY_API_SECRET", "")
+POLY_API_PASSPHRASE = os.getenv("POLY_API_PASSPHRASE", "")
 
 GAMMA_API = "https://gamma-api.polymarket.com"
-CLOB_API  = "https://clob.polymarket.com"
+CLOB_API = "https://clob.polymarket.com"
 
-# ---------- Trade log + balance history for dashboard ----------
+# ---------- Dashboard state ----------
 trade_log = deque(maxlen=20)
 balance_history = deque(maxlen=200)
 
@@ -36,13 +40,8 @@ def add_trade(strategy, token, shares, price, pnl=0.0):
 
 # ---------- Token ID discovery (Gamma API) ----------
 def get_token_ids():
-    """
-    Generate the slug for the current 5-minute BTC market,
-    fetch real token IDs from the Gamma API.
-    Returns {'up': '...', 'down': '...'} or None.
-    """
     now = datetime.now(timezone.utc)
-    interval = 300  # 5 minutes
+    interval = 300
     timestamp = int(now.timestamp())
     rounded = (timestamp // interval) * interval
     slug = f"btc-updown-5m-{rounded}"
@@ -56,12 +55,11 @@ def get_token_ids():
             if len(token_ids) >= 2:
                 return {"up": token_ids[0], "down": token_ids[1]}
     except Exception as e:
-        logging.error(f"Token ID fetch failed: {e}")
+        logging.error(f"Token ID fetch: {e}")
     return None
 
-# ---------- Price helpers (real CLOB API calls) ----------
+# ---------- Price helpers ----------
 def get_best_ask(token_id):
-    """Best price to BUY this token (the ask)."""
     try:
         r = requests.get(f"{CLOB_API}/price", params={"token_id": token_id, "side": "BUY"}, timeout=5)
         if r.status_code == 200:
@@ -71,7 +69,6 @@ def get_best_ask(token_id):
     return None
 
 def get_best_bid(token_id):
-    """Best price to SELL this token (the bid)."""
     try:
         r = requests.get(f"{CLOB_API}/price", params={"token_id": token_id, "side": "SELL"}, timeout=5)
         if r.status_code == 200:
@@ -80,7 +77,7 @@ def get_best_bid(token_id):
         pass
     return None
 
-# ---------- Phase detection ----------
+# ---------- Phase ----------
 def get_phase():
     if PAPER_BALANCE < 10:
         return 1
@@ -97,23 +94,52 @@ def validate_order(notional):
         return False, "Exceeds 20% risk cap"
     return True, "OK"
 
-def place_order(token_label, shares, price, strategy):
+# ---------- Live order via L2 API ----------
+def submit_live_order(token_id, price, size, side):
+    if not POLY_API_KEY or not POLY_API_SECRET or not POLY_API_PASSPHRASE:
+        logging.error("L2 credentials missing – cannot place live order")
+        return False
+    try:
+        headers = {
+            "POLY-API-KEY": POLY_API_KEY,
+            "POLY-API-SECRET": POLY_API_SECRET,
+            "POLY-API-PASSPHRASE": POLY_API_PASSPHRASE
+        }
+        order = {
+            "token_id": token_id,
+            "price": str(price),
+            "size": str(size),
+            "side": side
+        }
+        resp = requests.post(f"{CLOB_API}/order", json=order, headers=headers, timeout=10)
+        if resp.status_code == 200:
+            logging.info(f"✅ LIVE ORDER: {token_id} {side} {size} @ {price}")
+            return True
+        else:
+            logging.error(f"Live order failed: {resp.status_code} {resp.text}")
+            return False
+    except Exception as e:
+        logging.error(f"Live order exception: {e}")
+        return False
+
+def place_order(token_label, shares, price, strategy, token_id=None):
     notional = shares * price
     valid, msg = validate_order(notional)
     if not valid:
         logging.warning(f"[{strategy}] SKIP: {msg}")
         return
-    pnl = 0.0
     if PAPER_TRADING:
+        pnl = 0.0
         if strategy == "MakerRebate":
             pnl = notional * 0.0005
         elif strategy == "WindowSniper":
-            if random.random() < 0.85:
-                pnl = (1.0 - price) * shares
-            else:
-                pnl = -notional
-    add_trade(strategy, token_label, shares, price, pnl)
-    logging.info(f"📄 [{strategy}] PAPER: {token_label} {shares:.1f} sh @ ${price:.2f} | notional ${notional:.2f} | sim PnL ${pnl:+.4f}")
+            pnl = (1.0 - price) * shares if random.random() < 0.85 else -notional
+        add_trade(strategy, token_label, shares, price, pnl)
+        logging.info(f"📄 [{strategy}] PAPER: {token_label} {shares:.1f} sh @ ${price:.2f} | sim PnL ${pnl:+.4f}")
+    else:
+        if token_id:
+            submit_live_order(token_id, price, shares, "BUY")
+            add_trade(strategy, token_label, shares, price, 0.0)  # log without PnL
 
 # ---------- Strategy threads ----------
 def maker_loop():
@@ -125,9 +151,7 @@ def maker_loop():
                     for label, tid in [("UP", ids["up"]), ("DOWN", ids["down"])]:
                         bid = get_best_bid(tid)
                         if bid and validate_order(2.0):
-                            place_order(label, 2.0, bid * 0.95, "MakerRebate")
-                else:
-                    logging.warning("Maker: no token IDs found this cycle")
+                            place_order(label, 2.0, bid * 0.95, "MakerRebate", tid)
         except Exception as e:
             logging.error(f"maker_loop: {e}")
         time.sleep(60)
@@ -142,11 +166,11 @@ def arb_loop():
                     down_ask = get_best_ask(ids["down"])
                     if up_ask and down_ask and (up_ask + down_ask) < 1.0:
                         if validate_order(up_ask) and validate_order(down_ask):
-                            place_order("UP", 1, up_ask, "NegSpreadArb")
-                            place_order("DOWN", 1, down_ask, "NegSpreadArb")
+                            place_order("UP", 1, up_ask, "NegSpreadArb", ids["up"])
+                            place_order("DOWN", 1, down_ask, "NegSpreadArb", ids["down"])
                             profit = 1.0 - (up_ask + down_ask)
                             add_trade("NegSpreadArb", "ARB", 1, up_ask + down_ask, profit)
-                            logging.info(f"🎯 ARB: cost ${up_ask+down_ask:.4f} | guaranteed profit ${profit:.4f}")
+                            logging.info(f"🎯 ARB: cost ${up_ask+down_ask:.4f} | profit ${profit:.4f}")
         except Exception as e:
             logging.error(f"arb_loop: {e}")
         time.sleep(5)
@@ -166,7 +190,6 @@ def sniper_loop():
             if not ids:
                 time.sleep(0.5)
                 continue
-            # Determine direction from Chainlink
             try:
                 r = requests.get("https://data.chain.link/streams/btc-usd", timeout=5)
                 curr = float(r.json()["price"])
@@ -195,12 +218,12 @@ def sniper_loop():
             tid = ids["up"] if label == "UP" else ids["down"]
             price = get_best_ask(tid)
             if price and price > 0.85:
-                place_order(label, 1, price, "WindowSniper")
+                place_order(label, 1, price, "WindowSniper", tid)
         except Exception as e:
             logging.error(f"sniper_loop: {e}")
         time.sleep(0.5)
 
-# ---------- Flask dashboard ----------
+# ---------- Terminal Dashboard ----------
 app = Flask(__name__)
 
 @app.route("/")
@@ -226,14 +249,13 @@ def dashboard():
             th {{ background: #111; }}
             .profit {{ color: #00ff00; }} .loss {{ color: #ff0000; }}
             canvas {{ width: 100%; max-height: 300px; margin-top: 10px; }}
-            .log {{ color: #0f0; }}
         </style>
         <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     </head>
     <body>
         <h1>⚡ PolySniper Terminal</h1>
         <div class="panel status">
-            <span>Paper: {str(PAPER_TRADING).upper()}</span>
+            <span>Mode: {('LIVE' if not PAPER_TRADING else 'PAPER').upper()}</span>
             <span>Balance: ${PAPER_BALANCE:.2f}</span>
             <span>Phase: {phase_names.get(phase)}</span>
             <span>Maker: {'ACTIVE' if phase>=1 else 'LOCKED'}</span>
@@ -247,13 +269,12 @@ def dashboard():
         <div class="panel">
             <h2>📋 Recent Trades</h2>
             <table id="trades">
-                <tr><th>Time</th><th>Strategy</th><th>Token</th><th>Shares</th><th>Price</th><th>Notional</th><th>Sim. PnL</th></tr>
+                <tr><th>Time</th><th>Strategy</th><th>Token</th><th>Shares</th><th>Price</th><th>Notional</th><th>PnL</th></tr>
             </table>
         </div>
         <script>
-            const balanceData = {balance_json};
-            const trades = {trades_json};
-            // Chart
+            const balanceData = JSON.parse('{balance_json}');
+            const trades = JSON.parse('{trades_json}');
             const ctx = document.getElementById('chart').getContext('2d');
             if (balanceData.length > 0) {{
                 new Chart(ctx, {{
@@ -261,7 +282,7 @@ def dashboard():
                     data: {{
                         labels: balanceData.map(p => new Date(p.t).toLocaleTimeString()),
                         datasets: [{{
-                            label: 'Paper Balance ($)',
+                            label: 'Balance ($)',
                             data: balanceData.map(p => p.y),
                             borderColor: '#00ff00',
                             backgroundColor: 'rgba(0,255,0,0.1)',
@@ -279,18 +300,14 @@ def dashboard():
                         plugins: {{ legend: {{ labels: {{ color: '#00ff00' }} }} }}
                     }}
                 }});
-            }} else {{
-                ctx.parentElement.innerHTML = '<p class="log">Waiting for data...</p>';
             }}
-            // Trade table
             const table = document.getElementById('trades');
             if (trades.length === 0) {{
                 const row = table.insertRow();
                 const cell = row.insertCell();
                 cell.colSpan = 7;
-                cell.textContent = 'No trades yet — check runtime logs';
+                cell.textContent = 'Waiting for trades...';
                 cell.style.textAlign = 'center';
-                cell.style.color = '#0f0';
             }}
             trades.forEach(t => {{
                 const row = table.insertRow();
@@ -309,7 +326,7 @@ def dashboard():
     </html>
     """
 
-# ---------- Launch ----------
+# ---------- Start ----------
 def run_bot():
     time.sleep(2)
     for target in [maker_loop, arb_loop, sniper_loop]:
