@@ -1,15 +1,19 @@
-import os
+import os, time, logging, threading
+from datetime import datetime, timezone
+import requests
+from flask import Flask
 
-# ... other imports ...
+# ---------- Config ----------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 
 PAPER_TRADING = os.getenv("PAPER_TRADING", "True").lower() == "true"
 BALANCE = float(os.getenv("INITIAL_CAPITAL", "5"))
-PORT = int(os.getenv("PORT", "80"))   # <--- Must be 80, not 8080
+PORT = int(os.getenv("PORT", "80"))                # <-- default 80, overridable
 
 CHAINLINK_REST = "https://data.chain.link/streams/btc-usd"
 POLYMARKET_BOOK = "https://clob.polymarket.com/book"
 
-# ---------- Data Helpers ----------
+# ---------- Data helpers ----------
 def get_chainlink():
     try:
         r = requests.get(CHAINLINK_REST, timeout=5)
@@ -31,7 +35,7 @@ def get_best_bid(token):
     except:
         return None
 
-# ---------- Phase Logic ----------
+# ---------- Phase detection ----------
 def get_phase():
     if BALANCE < 10:
         return 1
@@ -42,7 +46,7 @@ def get_phase():
     else:
         return 4
 
-# ---------- Order Validation ----------
+# ---------- Order validation ----------
 def validate_order(notional):
     if notional < 1.0:
         return False, "Below $1 min"
@@ -59,7 +63,7 @@ def place_order(token, shares, price, strategy_name):
     if PAPER_TRADING:
         logging.info(f"📄 [{strategy_name}] PAPER: {token} {shares:.1f} sh @ ${price:.2f} | notional ${notional:.2f}")
 
-# ---------- Strategy Threads ----------
+# ---------- Strategy threads ----------
 def maker_loop():
     while True:
         try:
@@ -87,10 +91,11 @@ def arb_loop():
             logging.error(f"arb_loop error: {e}")
         time.sleep(5)
 
+p0 = None
+last_cycle = None
+
 def sniper_loop():
     global p0, last_cycle
-    p0 = None
-    last_cycle = None
     while True:
         try:
             if get_phase() < 3:
@@ -125,7 +130,7 @@ def sniper_loop():
             logging.error(f"sniper_loop error: {e}")
         time.sleep(0.5)
 
-# ---------- Flask App ----------
+# ---------- Flask app ----------
 app = Flask(__name__)
 
 @app.route("/")
@@ -140,10 +145,10 @@ def dashboard():
     <p>Maker: {'ACTIVE' if phase>=1 else 'LOCKED'}</p>
     <p>Arb: {'ACTIVE' if phase>=2 else 'LOCKED'}</p>
     <p>Sniper: {'ACTIVE' if phase>=3 else 'LOCKED'}</p>
+    <p>Port: {PORT}</p>
     """
 
 def run_bot():
-    # Start strategy threads after a short delay to let Flask bind first
     time.sleep(2)
     for target in [maker_loop, arb_loop, sniper_loop]:
         t = threading.Thread(target=target, daemon=True)
@@ -151,5 +156,5 @@ def run_bot():
         logging.info(f"Started {target.__name__}")
 
 if __name__ == "__main__":
-    # ... thread start ...
+    threading.Thread(target=run_bot, daemon=True).start()
     app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
