@@ -1,14 +1,10 @@
-import os, time, logging, threading
-from datetime import datetime, timezone
-import requests
-from flask import Flask
+import os
 
-# ---------- Config ----------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+# ... other imports ...
 
 PAPER_TRADING = os.getenv("PAPER_TRADING", "True").lower() == "true"
 BALANCE = float(os.getenv("INITIAL_CAPITAL", "5"))
-PORT = int(os.getenv("PORT", "80"))
+PORT = int(os.getenv("PORT", "80"))   # <--- Must be 80, not 8080
 
 CHAINLINK_REST = "https://data.chain.link/streams/btc-usd"
 POLYMARKET_BOOK = "https://clob.polymarket.com/book"
@@ -155,7 +151,5 @@ def run_bot():
         logging.info(f"Started {target.__name__}")
 
 if __name__ == "__main__":
-    # Start the bot threads in background
-    threading.Thread(target=run_bot, daemon=True).start()
-    # Start Flask immediately
+    # ... thread start ...
     app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
